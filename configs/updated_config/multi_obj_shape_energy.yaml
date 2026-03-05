@@ -1,0 +1,150 @@
+run_name: BaseLine_NO_ADDITIONAL_LOSS
+dtype: float32
+
+# ========================================
+# MULTI-OBJECTIVE OPTIMIZATION
+# ========================================
+# Method: 'weighted_sum', 'grad_norm', 'uncertainty', 'dwa', 'config'
+mo_method: None
+
+
+# Loss flags (which losses to use)
+use_energy_loss: False
+use_moment_matching: False
+use_sparsity: False
+# ========================================
+# VOXEL ENERGY LOSS WITH WARMUP
+# ========================================
+use_voxel_energy_loss: False           # Enable for training (set false to only log)
+lambda_voxel_energy: 5.0e-4 #e-3          # Target weight after warmup completes
+voxel_loss_warmup_steps: 200000       # Number of steps to ramp from 0 to full weight
+# Weights for weighted_sum method (only used if mo_method: weighted_sum)
+
+voxel_loss_type: huber
+lambda_voxel_energy_min: 2.0e-5     # 5× smaller for late training
+lambda_decay_start_step: 500000    # Start decay at epoch ~200
+lambda_decay_end_step: 800000      # Complete decay at epoch ~600
+
+lambda_energy: 0.001
+lambda_moment: 1.0e-14 
+lambda_sparsity: 1.0e-4
+
+# DWA parameters (only used if mo_method: dwa)
+dwa_temperature: 2.0
+
+# ConFIG parameters (only used if mo_method: config)
+# config_objectives:  # Optional: specify which objectives to use
+#   - diffusion_loss
+#   - energy_loss
+#   - sparsity_loss
+config_objectives:
+  - diffusion_loss
+  - voxel_energy_loss
+
+# ========================================
+# DIFFUSION MODEL
+# ========================================
+# Diffusion-specific parameters
+num_timesteps: 1000
+beta_start: 0.0001
+beta_end: 0.02
+beta_schedule: cosine  # 'linear', 'cosine', 'sigmoid'
+prediction_type: noise  # 'noise', 'x0', 'v'
+
+# ========================================
+# ENERGY LOSS CONFIGURATION
+# ========================================
+# Energy loss uses layer-wise energy conservation
+# Parameters already specified in transforms above
+
+# ========================================
+# SPARSITY CONFIGURATION
+# ========================================
+# Sparsity/occupancy parameters
+occ_tau: 0.0      # Threshold for occupancy
+occ_temp: 1.0     # Temperature for soft occupancy
+
+# Model
+model_type: shape
+energy_model: /project/biocomplexity/fa7sa/calo_dreamer/results/20250625_145756_d2_energy_model_DDPM_epoch_500_RERUN/
+model: TBD_DIFF
+
+# Data
+hdf5_file: /project/biocomplexity/fa7sa/calochallenge_datasets/dataset_2/dataset_2_1_25k_part1.hdf5
+eval_hdf5_file: /project/biocomplexity/fa7sa/calochallenge_datasets/dataset_2/dataset_2_2_25k_part1.hdf5
+val_CFD_hdf5_file: /project/biocomplexity/fa7sa/calochallenge_datasets/dataset_2/dataset_2_1_CFD_REF_2K.hdf5
+voxel_CFD_ref: /project/biocomplexity/fa7sa/calochallenge_datasets/dataset_2/voxel_CFD_ref.hdf5
+xml_filename: /project/biocomplexity/fa7sa/calo_dreamer/src/challenge_files/binning_dataset_2.xml
+
+val_frac: 0.15
+eps: 1.0e-10
+particle_type: electron
+eval_dataset: "2"
+eval_cut: 15.15e-3
+shape: [1, 45, 16, 9]
+
+transforms: {
+    ScaleVoxels: {factor: 0.35},
+    NormalizeByElayer: {
+        ptype: /project/biocomplexity/fa7sa/calo_dreamer/src/challenge_files/binning_dataset_2.xml,
+        xml_file: electron
+    },
+    CutValues: {cut: 1.0e-7},
+    SelectiveUniformNoise: {
+        noise_width: 0.0e-6,
+        cut: True,
+        exclusions: [-45, -44, -43, -42, -41, -40, -39, -38, -37,
+                     -36, -35, -34, -33, -32, -31, -30, -29, -28,
+                     -27, -26, -25, -24, -23, -22, -21, -20, -19,
+                     -18, -17, -16, -15, -14, -13, -12, -11, -10,
+                      -9,  -8,  -7,  -6,  -5,  -4,  -3,  -2,  -1]
+    },
+    ExclusiveLogitTransform: {delta: 1.0e-6, rescale: True},
+    StandardizeFromFile: {},
+    LogEnergy: {},
+    ScaleEnergy: {e_min: 6.907755, e_max: 13.815510},
+    AddFeaturesToCond: {split_index: 6480},
+    Reshape: {shape: [1, 45, 16, 9]}
+}
+
+# Training
+lr: 1.e-4
+max_lr: 3.e-4
+batch_size: 64
+validate_every: 1
+use_scheduler: True
+lr_scheduler: CosineAnnealing
+weight_decay: 1.e-5
+betas: [0.9, 0.999]
+n_epochs: 10
+cycle_epochs: 10
+cycle_pct_start: 0.1
+save_interval: 100_001
+clip_gradients_to: 100
+add_noise: False
+validate_voxel_CFD: True
+validate_voxel_CFD_every: 1
+voxel_CFD_ddim_steps: 10
+voxel_CFD_ddim_eta: 0
+# Sampling
+sample_periodically: False
+sample_every: 10
+sample_every_n_samples: 1001
+batch_size_sample: 64
+n_samples: 100
+solver_kwargs: {method: rk4, options: {step_size: 0.02}}
+
+# Network 
+network: ViT
+condition_dim: 46
+patch_shape: [3, 16, 1]
+hidden_dim: 240
+depth: 6
+num_heads: 6
+mlp_ratio: 4.0
+augment_batch: False
+pos_embedding_coords: cylindrical
+learn_pos_embed: True
+cos_attn: False
+causal_attn: False
+coarse: False
