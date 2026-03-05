@@ -38,7 +38,7 @@
 *.sif
 
 # Ignore Jupyter notebook checkpoints
-.ipynb_checkpoints/
+**/.ipynb_checkpoints/
 
 # Ignore experiment output directory
 out_diffusion_2d/
