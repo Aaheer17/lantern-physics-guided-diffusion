@@ -1,0 +1,45 @@
+/venv/
+/runs/
+/log/
+/results/
+/.idea
+/params
+/log/
+.DS_Store
+*.ipynb
+**__pycache__
+*.xml
+*.hdf5
+# Ignore PDF files
+*.pdf
+
+# Ignore images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.svg
+
+# Ignore shell scripts
+*.sh
+
+# Ignore output files
+*.out
+
+# Ignore text files
+*.txt
+# Ignore numpy data files
+*.npy
+*.npz
+
+# Ignore singularity container images
+*.sif
+
+# Ignore Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore experiment output directory
+out_diffusion_2d/
+stats_ds2/
