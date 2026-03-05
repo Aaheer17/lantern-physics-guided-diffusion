@@ -43,3 +43,11 @@
 # Ignore experiment output directory
 out_diffusion_2d/
 stats_ds2/
+# Ignore everything inside configs
+configs/*
+
+# Except this folder
+!configs/updated_config/
+
+# And allow files inside it
+!configs/updated_config/**
