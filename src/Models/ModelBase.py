@@ -2,13 +2,14 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import os, time
+import os
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from matplotlib.backends.backend_pdf import PdfPages
 from conflictfree.grad_operator import ConFIG_update
 from conflictfree.utils import apply_gradient_vector, get_gradient_vector
 from conflictfree.length_model import TrackSpecific
+from conflictfree.grad_operator import PCGradOperator, IMTLGOperator
 import sys
 import h5py
 # Other functions of project
@@ -25,10 +26,9 @@ import Models
 from Models import *
 import time
 from itertools import islice
-import pwd
+
 import pandas as pd
-def get_username():
-    return pwd.getpwuid(os.getuid())[0]
+
 from Models.multi_objective import create_mo_optimizer
 
 class GenerativeModel(nn.Module):
@@ -118,6 +118,10 @@ class GenerativeModel(nn.Module):
         self.validate_voxel_CFD = get(self.params, "validate_voxel_CFD", False)
         self.validate_voxel_CFD_every = get(self.params, "validate_voxel_CFD_every", 0)
 
+        # ── ADD ONLY THESE TWO LINES ──────────────────────────────────────────────
+        self.use_laplacian_loss = get(self.params, 'use_laplacian_loss', False)
+        self.lambda_laplacian   = get(self.params, 'lambda_laplacian', 0.01)
+
         self.val_voxel_cfd_epoch = np.array([], dtype=np.float64)
         # Only read CFD-specific paths if enabled
         if self.validate_voxel_CFD:
@@ -178,6 +182,21 @@ class GenerativeModel(nn.Module):
 
         self.use_voxel_shape_loss = get(self.params, 'use_voxel_shape_loss', False)
         self.lambda_voxel_shape  = get(self.params, 'lambda_voxel_shape', 1e-4)
+        # ── GradNorm ──────────────────────────────────────────────────────────
+        # mo_method: 'gradnorm'
+        # Learns w_i(t) for each objective by minimising a gradient norm loss.
+        # phi_t modulation for laplacian is applied inside batch_loss before
+        # loss_tensors is returned — GradNorm sees phi_t * L_lap as one task.
+        self.gradnorm_alpha    = get(self.params, 'gradnorm_alpha', 1.5)
+        self.gradnorm_lr       = get(self.params, 'gradnorm_lr',   1e-3)
+        self.gradnorm_balancer = None  # initialised in prepare_training()
+        # ── Gradient Blending (professor's method) ──────────────────────────
+        # mo_method: 'grad_blend'
+        # g_new = β ( ĝ1 + α·ĝ2 )  where β preserves ||g_old|| = ||g1 + g2||
+        # alpha = 1.0  →  bisector (equal weight, same direction as ConFIG)
+        # alpha < 1.0  →  bias toward diffusion (primary objective)
+        # alpha = 0.0  →  pure diffusion
+        self.blend_alpha = get(self.params, 'blend_alpha', 1.0)
 
     def build_net(self):
         pass
@@ -214,7 +233,8 @@ class GenerativeModel(nn.Module):
             self.use_moment_matching or 
             self.use_sparsity or 
             self.use_voxel_energy_loss or
-            self.use_voxel_shape_loss
+            self.use_voxel_shape_loss or
+            self.use_laplacian_loss
         )
     
         if not has_aux_losses:
@@ -222,7 +242,7 @@ class GenerativeModel(nn.Module):
             print("✓ No auxiliary losses enabled - using simple diffusion loss only")
             self.mo_optimizer = None
             self.mo_method = 'none'  # Mark as no MO
-        elif self.mo_method != 'config':
+        elif self.mo_method not in ('config', 'grad_blend', 'pcgrad', 'imtlg', 'gradnorm'):
             mo_kwargs = {}
             
             if self.mo_method == 'weighted_sum':
@@ -233,6 +253,7 @@ class GenerativeModel(nn.Module):
                     'sparsity_loss': self.lambda_sparsity,
                     'voxel_energy_loss': self.lambda_voxel_energy,
                     'voxel_shape_loss':  self.lambda_voxel_shape,
+                    'laplacian_loss': self.lambda_laplacian,
 
                 }
             elif self.mo_method == 'dwa':
@@ -248,7 +269,31 @@ class GenerativeModel(nn.Module):
             )
             print(f"✓ Multi-objective optimizer: {self.mo_method}")
         else:
-            print(f"✓ Multi-objective optimizer: ConFIG (gradient-based)")
+            if self.mo_method == 'config':
+                print(f"✓ Multi-objective optimizer: ConFIG (gradient-based)")
+            elif self.mo_method == 'grad_blend':
+                print(f"✓ Multi-objective optimizer: Gradient Blending "
+                      f"(professor's method, alpha={self.blend_alpha})")
+            elif self.mo_method == 'pcgrad':
+                print(f"✓ Multi-objective optimizer: PCGrad (gradient surgery)")
+            elif self.mo_method == 'imtlg':
+                print(f"✓ Multi-objective optimizer: IMTL-G (impartial multi-task learning)")
+            elif self.mo_method == 'gradnorm':
+                from Models.gradnorm import GradNormBalancer   # see Change 4
+                objectives = [k for k in [
+                    'diffusion_loss', 'voxel_energy_loss', 'laplacian_loss',
+                    'energy_loss', 'moment_loss', 'sparsity_loss'
+                ] if get(self.params, f'use_{k.replace("_loss","")}', k == 'diffusion_loss')]
+            
+                self.gradnorm_balancer = GradNormBalancer(
+                    num_tasks  = len(objectives),
+                    alpha      = self.gradnorm_alpha,
+                    lr         = self.gradnorm_lr,
+                    device     = self.device,
+                )
+                self.gradnorm_objectives = objectives 
+                print(f"✓ Multi-objective optimizer: GradNorm "
+                      f"(alpha={self.gradnorm_alpha}, tasks={objectives})")
         
 
         
@@ -280,7 +325,7 @@ class GenerativeModel(nn.Module):
                 self.net.parameters(),
                 lr = params.get("lr", 0.0002),
                 betas = params.get("betas", [0.9, 0.999]),
-                eps = params.get("eps", 1e-6),
+                eps = params.get("optimizer_eps", 1e-6),
                 weight_decay = params.get("weight_decay", 0.)
                 )
         self.scheduler = set_scheduler(self.optimizer, params, steps_per_epoch, last_epoch=-1)
@@ -508,9 +553,10 @@ class GenerativeModel(nn.Module):
             return loss_tensors['diffusion_loss'], {}
         
         # ========================================
-        # CASE 2: ConFIG - return diffusion loss (handled in train_one_epoch)
+        # CASE 2: ConFIG or grad_blend
+        # both handle the gradient step separately in train_one_epoch
         # ========================================
-        if self.mo_method == 'config':
+        if self.mo_method in ('config', 'grad_blend', 'pcgrad', 'imtlg'):
             return loss_tensors['diffusion_loss'], {}
         
         # ========================================
@@ -524,6 +570,7 @@ class GenerativeModel(nn.Module):
             'sparsity_loss': self.use_sparsity,
             'voxel_energy_loss':self.use_voxel_energy_loss,
             'voxel_shape_loss': self.use_voxel_shape_loss,
+            'laplacian_loss':    self.use_laplacian_loss, 
         }
         
         # Use the MO optimizer
@@ -553,80 +600,389 @@ class GenerativeModel(nn.Module):
             "sparsity_loss",
             'voxel_energy_loss',
             'voxel_shape_loss',
+            "laplacian_loss",
         ]
         return [k for k in default_order if k in loss_tensors]
-    def _step_with_config(self, loss_tensors: dict) -> dict:
+    # ============================================================
+    # GRADIENT STEP HELPERS  —  drop these into GenerativeModel
+    # ============================================================
+    #
+    # Structure
+    # ---------
+    # _compute_per_objective_grads   shared gradient extraction (called by every _step_with_*)
+    # _compute_gradient_diagnostics  correct norms / cosines / angles in degrees
+    # _step_with_config              ConFIG bisector
+    # _step_with_grad_blend          professor's blending method
+    # _step_with_pcgrad              gradient surgery
+    # _step_with_imtlg               impartial multi-task learning
+    #
+    # Every _step_with_* method follows the same four-step pattern:
+    #   1. Extract per-objective gradients          (_compute_per_objective_grads)
+    #   2. Fallback to diffusion if NaN/Inf found
+    #   3. Compute the method-specific combined gradient
+    #   4. Compute diagnostics                      (_compute_gradient_diagnostics)
+    # ============================================================
+    
+    def _compute_per_objective_grads(self, loss_tensors: dict, objectives: list):
         """
-        Perform one optimizer step using ConFIG over selected objectives.
+        Backpropagate each objective separately and collect flat gradient vectors.
     
-        Returns:
-          info: dict of scalar diagnostics to log (config_used, grad norms, dot products, etc.)
+        Returns
+        -------
+        grads    : list[Tensor]  one flat gradient vector per objective, same order
+        grad_ok  : bool          False if any gradient contains NaN or Inf
         """
-        info = {}
-        objectives = self._get_config_objectives(loss_tensors)
-        # Sanity check: TrackSpecific(track_id=0) assumes diffusion_loss is first
-        assert objectives[0] == "diffusion_loss", (
-            f"TrackSpecific(track_id=0) requires diffusion_loss at index 0, "
-            f"but got: {objectives}"
-        )
-    
-        # If not enough objectives, ConFIG doesn't make sense
-        if len(objectives) < 2:
-            info["config_used"] = 0.0
-            return info
-    
-        grads = []
+        grads   = []
         grad_ok = True
     
-        # Compute per-objective gradient vectors
-        for name in objectives:
+        for i, name in enumerate(objectives):
             self.optimizer.zero_grad(set_to_none=True)
-            loss_tensors[name].backward(retain_graph=True)
-    
-            g = get_gradient_vector(self.net)  # flat vector
+            retain = (i < len(objectives) - 1)
+            loss_tensors[name].backward(retain_graph=retain)
+            g = get_gradient_vector(self.net)
             grads.append(g)
-    
-            # diagnostics: grad norm per objective
-            g_norm = torch.linalg.vector_norm(g).detach().item()
-            info[f"config_gnorm_{name}"] = float(g_norm)
     
             if torch.isnan(g).any() or torch.isinf(g).any():
                 grad_ok = False
     
-        # Pairwise dot products (conflict diagnostics)
-        # Note: O(K^2) where K=#objectives, fine for small K
+        return grads, grad_ok
+    
+    
+    def _compute_gradient_diagnostics(self, grads: list, objectives: list,
+                                       g_combined=None) -> dict:
+        """
+        Compute gradient diagnostics with correct geometry.
+    
+        All angles are in degrees. All cosines are clipped to [-1, 1].
+        Norm ratios use objectives[0] (always diffusion_loss) as the denominator.
+    
+        Parameters
+        ----------
+        grads      : list[Tensor]   per-objective flat gradient vectors
+        objectives : list[str]      objective names, same order as grads
+        g_combined : Tensor | None  combined gradient (ConFIG / blend / pcgrad / imtlg)
+    
+        CSV columns produced
+        --------------------
+        gnorm_{name}                          per-objective gradient norm
+        gnorm_ratio_{name}_over_diff          ||g_aux|| / ||g_diff||   (key imbalance diagnostic)
+        cos_{obj_i}__{obj_j}                  pairwise cosine similarity between raw gradients
+        angle_deg_{obj_i}__{obj_j}            pairwise angle in degrees between raw gradients
+        gnorm_combined                        norm of the combined gradient
+        cos_combined__{name}                  cosine between g_combined and each raw gradient
+        angle_deg_combined__{name}            angle in degrees between g_combined and each raw gradient
+        """
+        info  = {}
+        norms = [float(torch.linalg.vector_norm(g).item()) for g in grads]
+    
+        # ── per-objective norms ──────────────────────────────────────────────────
+        for name, n in zip(objectives, norms):
+            info[f"gnorm_{name}"] = n
+    
+        # ── norm ratio: aux / diffusion ──────────────────────────────────────────
+        norm_diff = norms[0] + 1e-10
+        for name, n in zip(objectives[1:], norms[1:]):
+            info[f"gnorm_ratio_{name}_over_diff"] = n / norm_diff
+    
+        # ── pairwise angles between raw gradients ────────────────────────────────
         for i in range(len(objectives)):
             for j in range(i + 1, len(objectives)):
-                dot_ij = torch.dot(grads[i], grads[j]).detach().item()
-                info[f"config_gdot_{objectives[i]}__{objectives[j]}"] = float(dot_ij)
+                denom  = (norms[i] * norms[j]) + 1e-10
+                cos_ij = float(np.clip(
+                    float(torch.dot(grads[i], grads[j]).item()) / denom,
+                    -1.0, 1.0
+                ))
+                info[f"cos_{objectives[i]}__{objectives[j]}"]       = cos_ij
+                info[f"angle_deg_{objectives[i]}__{objectives[j]}"] = float(np.degrees(np.arccos(cos_ij)))
     
-        if not grad_ok:
-            # Fall back to first objective's gradient
-            info["config_used"] = 0.0
-            # ensure params.grad is set to grads[0]
-            apply_gradient_vector(self.net, grads[0])
-            return info
-    
-        # ConFIG combine + apply
-        g_config = ConFIG_update(grads, length_model=TrackSpecific(track_id=0))
-        apply_gradient_vector(self.net, g_config)
-    
-        # grad norm of combined update
-        info["config_used"] = 1.0
-        info["config_gnorm_combined"] = float(torch.linalg.vector_norm(g_config).detach().item())
-        info["config_num_objectives"] = float(len(objectives))
-
-        # ========================================================================
-        # NEW: Compute angles between CONFIG's combined gradient and each objective
-        # ========================================================================
-        # This shows how much CONFIG is following each objective's gradient
-        for i, name in enumerate(objectives):
-            dot_combined_obj = torch.dot(g_config, grads[i]).detach().item()
-            info[f"config_gdot_combined__{name}"] = float(dot_combined_obj)
-        # ========================================================================
+        # ── angles between combined gradient and each raw gradient ───────────────
+        if g_combined is not None:
+            norm_combined = float(torch.linalg.vector_norm(g_combined).item())
+            info["gnorm_combined"] = norm_combined
+            for name, g, n in zip(objectives, grads, norms):
+                cos_ci = float(np.clip(
+                    float(torch.dot(g_combined, g).item()) / ((norm_combined + 1e-10) * (n + 1e-10)),
+                    -1.0, 1.0
+                ))
+                info[f"cos_combined__{name}"]       = cos_ci
+                info[f"angle_deg_combined__{name}"] = float(np.degrees(np.arccos(cos_ci)))
     
         return info
-
+    
+    
+    # ─────────────────────────────────────────────────────────────────────────────
+    # ConFIG
+    # ─────────────────────────────────────────────────────────────────────────────
+    
+    def _step_with_config(self, loss_tensors: dict) -> dict:
+        """
+        ConFIG update: combined gradient is the unit bisector of all objective
+        gradients, scaled by the length model (TrackSpecific or unit norm).
+    
+        For two objectives the combined direction is always proportional to
+        û_diff + û_aux, so each objective sees an angle of θ/2.
+        Apparent 0° readings in diagnostic plots are numerical artifacts from
+        near-zero gradient norms, not real alignment.
+        """
+        info       = {}
+        objectives = self._get_config_objectives(loss_tensors)
+    
+        assert objectives[0] == "diffusion_loss", (
+            f"ConFIG requires diffusion_loss at index 0, got: {objectives}"
+        )
+        if len(objectives) < 2:
+            return {"config_used": 0.0}
+    
+        # ── 1. per-objective gradients ───────────────────────────────────────────
+        grads, grad_ok = self._compute_per_objective_grads(loss_tensors, objectives)
+    
+        # ── 2. fallback ──────────────────────────────────────────────────────────
+        if not grad_ok:
+            apply_gradient_vector(self.net, grads[0])
+            return {"config_used": 0.0}
+    
+        # ── 3. ConFIG combined gradient ──────────────────────────────────────────
+        g_config = ConFIG_update(grads, use_least_square=False)
+        apply_gradient_vector(self.net, g_config)
+    
+        # ── 4. diagnostics ───────────────────────────────────────────────────────
+        info = self._compute_gradient_diagnostics(grads, objectives, g_combined=g_config)
+        info["config_used"]          = 1.0
+        info["config_num_objectives"] = float(len(objectives))
+    
+        return info
+    
+    
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Gradient Blending (professor's method)
+    # ─────────────────────────────────────────────────────────────────────────────
+    
+    def _step_with_grad_blend(self, loss_tensors: dict) -> dict:
+        """
+        Gradient blending:
+    
+            g_new = β ( û_diff + α · mean(û_aux_i) )
+    
+        where
+            û_i   = g_i / ||g_i||          unit gradient
+            α     = self.blend_alpha        diffusion bias
+                      1.0 → bisector (same direction as ConFIG)
+                      <1.0 → bias toward diffusion
+                      0.0 → pure diffusion
+            β     = ||g_naive|| / ||direction||
+                    preserves the magnitude of the naive sum g_diff + g_aux
+    
+        No solver needed. β is computed analytically.
+        """
+        info       = {}
+        objectives = self._get_config_objectives(loss_tensors)
+    
+        assert objectives[0] == "diffusion_loss", (
+            f"grad_blend requires diffusion_loss at index 0, got: {objectives}"
+        )
+        if len(objectives) < 2:
+            return {"blend_used": 0.0}
+    
+        # ── 1. per-objective gradients ───────────────────────────────────────────
+        grads, grad_ok = self._compute_per_objective_grads(loss_tensors, objectives)
+    
+        # ── 2. fallback ──────────────────────────────────────────────────────────
+        if not grad_ok:
+            apply_gradient_vector(self.net, grads[0])
+            return {"blend_used": 0.0}
+    
+        # ── 3. blended combined gradient ─────────────────────────────────────────
+        alpha = self.blend_alpha
+        norms = [float(torch.linalg.vector_norm(g).item()) for g in grads]
+        units = [g / (n + 1e-10) for g, n in zip(grads, norms)]
+    
+        # direction: û_diff + α * mean(û_aux)
+        g_direction = units[0].clone()
+        aux_weight  = alpha / max(len(objectives) - 1, 1)
+        for u in units[1:]:
+            g_direction = g_direction + aux_weight * u
+    
+        # magnitude: preserve ||naive sum||
+        g_naive    = sum(grads[1:], grads[0].clone())
+        g_naive_norm = float(torch.linalg.vector_norm(g_naive).item())
+        dir_norm   = float(torch.linalg.vector_norm(g_direction).item())
+        beta       = g_naive_norm / (dir_norm + 1e-10)
+    
+        g_blend = beta * g_direction
+        apply_gradient_vector(self.net, g_blend)
+    
+        # ── 4. diagnostics ───────────────────────────────────────────────────────
+        info = self._compute_gradient_diagnostics(grads, objectives, g_combined=g_blend)
+        info["blend_used"]          = 1.0
+        info["blend_alpha"]         = alpha
+        info["blend_beta"]          = beta
+        info["config_num_objectives"] = float(len(objectives))
+    
+        return info
+    
+    
+    # ─────────────────────────────────────────────────────────────────────────────
+    # PCGrad
+    # ─────────────────────────────────────────────────────────────────────────────
+    
+    def _step_with_pcgrad(self, loss_tensors: dict) -> dict:
+        """
+        PCGrad — Gradient Surgery (Yu et al., NeurIPS 2020).
+    
+        For each gradient g_i, remove the projection onto g_j when they conflict:
+            if dot(g_i, g_j) < 0:
+                g_i = g_i - ( dot(g_i, g_j) / ||g_j||^2 ) * g_j
+    
+        The projected gradients are then summed.
+    
+        When gradients are near-orthogonal (cos ≈ 0), PCGrad reduces to
+        a plain sum — no projection occurs. When they conflict (cos < 0),
+        only the conflicting component is removed.
+        """
+        info       = {}
+        objectives = self._get_config_objectives(loss_tensors)
+    
+        assert objectives[0] == "diffusion_loss", (
+            f"pcgrad requires diffusion_loss at index 0, got: {objectives}"
+        )
+        if len(objectives) < 2:
+            return {"pcgrad_used": 0.0}
+    
+        # ── 1. per-objective gradients ───────────────────────────────────────────
+        grads, grad_ok = self._compute_per_objective_grads(loss_tensors, objectives)
+    
+        # ── 2. fallback ──────────────────────────────────────────────────────────
+        if not grad_ok:
+            apply_gradient_vector(self.net, grads[0])
+            return {"pcgrad_used": 0.0}
+    
+        # ── 3. PCGrad combined gradient ──────────────────────────────────────────
+        g_pc = PCGradOperator().calculate_gradient(grads)
+        apply_gradient_vector(self.net, g_pc)
+    
+        # ── 4. diagnostics ───────────────────────────────────────────────────────
+        info = self._compute_gradient_diagnostics(grads, objectives, g_combined=g_pc)
+    
+        # count conflicting pairs (unordered)
+        n_conflicts = sum(
+            1 for i in range(len(grads)) for j in range(i + 1, len(grads))
+            if float(torch.dot(grads[i], grads[j]).item()) < 0
+        )
+        info["pcgrad_used"]            = 1.0
+        info["pcgrad_conflict_pairs"]  = float(n_conflicts)
+        info["config_num_objectives"]  = float(len(objectives))
+    
+        return info
+    
+    
+    # ─────────────────────────────────────────────────────────────────────────────
+    # IMTL-G
+    # ─────────────────────────────────────────────────────────────────────────────
+    
+    def _step_with_imtlg(self, loss_tensors: dict) -> dict:
+        """
+        IMTL-G — Impartial Multi-Task Learning via Gradient (Liu et al., ICLR 2021).
+    
+        Finds weights α_i such that:
+            û_i · g_combined = û_j · g_combined  for all i, j   (impartiality)
+    
+        Unlike ConFIG (unit-space bisector) and grad_blend (unit direction, raw
+        magnitude), IMTL-G works in raw gradient space and uses magnitudes to
+        set weights automatically. For the Laplacian loss with its 119× norm
+        amplification, IMTL-G automatically down-weights g_lap to enforce
+        impartiality — no manual spectral normalization required.
+    
+        Verification: imtlg_proj_{name} values should be equal across all
+        objectives. Inequality indicates the library's solver is struggling.
+        """
+        info       = {}
+        objectives = self._get_config_objectives(loss_tensors)
+    
+        assert objectives[0] == "diffusion_loss", (
+            f"imtlg requires diffusion_loss at index 0, got: {objectives}"
+        )
+        if len(objectives) < 2:
+            return {"imtlg_used": 0.0}
+    
+        # ── 1. per-objective gradients ───────────────────────────────────────────
+        grads, grad_ok = self._compute_per_objective_grads(loss_tensors, objectives)
+    
+        # ── 2. fallback ──────────────────────────────────────────────────────────
+        if not grad_ok:
+            apply_gradient_vector(self.net, grads[0])
+            return {"imtlg_used": 0.0}
+    
+        # ── 3. IMTL-G combined gradient ──────────────────────────────────────────
+        g_imtlg = IMTLGOperator().calculate_gradient(grads)
+        apply_gradient_vector(self.net, g_imtlg)
+    
+        # ── 4. diagnostics ───────────────────────────────────────────────────────
+        info = self._compute_gradient_diagnostics(grads, objectives, g_combined=g_imtlg)
+    
+        # impartiality check: û_i · g_imtlg should be equal for all i
+        grads_stack = torch.stack(grads)
+        norms_vec   = grads_stack.norm(dim=1, keepdim=True).clamp(min=1e-10)
+        units       = grads_stack / norms_vec
+        for name, u in zip(objectives, units):
+            info[f"imtlg_proj_{name}"] = float(torch.dot(u, g_imtlg).item())
+    
+        info["imtlg_used"]            = 1.0
+        info["config_num_objectives"] = float(len(objectives))
+    
+        return info
+    # ─────────────────────────────────────────────────────────────────────────────
+    # GradNorm
+    # ─────────────────────────────────────────────────────────────────────────────
+    
+    def _step_with_gradnorm(self, loss_tensors: dict) -> dict:
+        if self.gradnorm_balancer is None:
+            loss_tensors['diffusion_loss'].backward()
+            return {"gradnorm_used": 0.0}
+    
+        objectives = getattr(self, 'gradnorm_objectives', None)
+        if objectives is None:
+            loss_tensors['diffusion_loss'].backward()
+            return {"gradnorm_used": 0.0}
+    
+        # filter to keys present in loss_tensors this step
+        objectives = [k for k in objectives if k in loss_tensors]
+    
+        # guard: assert replaced with clean fallback
+        if not objectives or objectives[0] != "diffusion_loss":
+            loss_tensors['diffusion_loss'].backward()
+            return {"gradnorm_used": 0.0}
+    
+        if len(objectives) < 2:
+            loss_tensors['diffusion_loss'].backward()
+            return {"gradnorm_used": 0.0}
+    
+        # guard: task count must match what balancer was built with
+        if len(objectives) != self.gradnorm_balancer.num_tasks:
+            loss_tensors['diffusion_loss'].backward()
+            return {"gradnorm_used": 0.0, "gradnorm_task_mismatch": 1.0}
+    
+        losses = [loss_tensors[k] for k in objectives]
+    
+        # last shared ViT block — GradNorm computes norms here only
+        shared_params = list(self.net.transformer_blocks[-1].parameters())
+    
+        # GradNorm step: updates w_i, returns weighted total loss (w detached)
+        L_total, gradnorm_info, per_obj_grads = self.gradnorm_balancer.step(
+            losses        = losses,
+            objectives    = objectives,
+            shared_params = shared_params,
+            all_params    = list(self.net.parameters()),
+        )
+    
+        # main backward on weighted total
+        self.optimizer.zero_grad(set_to_none=True)
+        L_total.backward()
+    
+        info = {"gradnorm_used": 1.0}
+        info.update(gradnorm_info)
+    
+        return info
+        
     def train_one_epoch(self):
         """Train for one epoch. batch_loss must return (loss_tensors:dict, loss_scalars:dict)."""
         self.net.train()
@@ -638,8 +994,7 @@ class GenerativeModel(nn.Module):
         mo_method = getattr(self, "mo_method", "weighted_sum")
     
         for batch_id, x in enumerate(self.train_loader):
-            if get_username() == 'zm8bh' and batch_id > 2:
-                break
+
     
             n_batches += 1
             self.global_step += 1
@@ -687,7 +1042,7 @@ class GenerativeModel(nn.Module):
             # ==========================================
             # Branch 2: NON-ConFIG (regular MO backward)
             # ==========================================
-            elif mo_method != "config":
+            elif mo_method == "weighted_sum":
                 total_loss, mo_info = self.combine_losses(loss_tensors)
     
                 # scalar-friendly mo_info
@@ -722,7 +1077,7 @@ class GenerativeModel(nn.Module):
             # ==========================================
             # Branch 3: ConFIG (apply gradient vector)
             # ==========================================
-            else:
+            elif mo_method == "config":
                 # total_loss for reporting only
                 report_total, report_info = self.combine_losses(loss_tensors)
                 report_info = {
@@ -759,9 +1114,151 @@ class GenerativeModel(nn.Module):
                     skipped += 1
                     loss_scalars["config_used"] = 0.0
                     print(f"Unstable total_loss (reporting) at epoch {self.epoch}, batch {batch_id} (skipping step)")
-    
+
+            # ==========================================
+            # Branch 4: Gradient Blending (professor's method)
+            # ==========================================
+            elif mo_method == "grad_blend":
+                # total_loss for reporting only — same pattern as config branch
+                report_total, report_info = self.combine_losses(loss_tensors)
+                report_info = {
+                    k: (float(v.detach().item()) if hasattr(v, "detach") else float(v))
+                    for k, v in (report_info or {}).items()
+                }
+                loss_scalars["total_loss"] = float(report_total.detach().item())
+                loss_scalars.update(report_info)
+
+                if np.isfinite(loss_scalars["total_loss"]):
+                    # Compute + apply blended gradient
+                    blend_info = self._step_with_grad_blend(loss_tensors)
+
+                    clip = self.params.get("clip_gradients_to", None)
+                    if clip:
+                        nn.utils.clip_grad_norm_(self.net.parameters(), clip)
+
+                    self.optimizer.step()
+                    did_step = 1.0
+
+                    if hasattr(self, "update_ema"):
+                        self.update_ema()
+
+                    if getattr(self, "use_scheduler", False) and getattr(self, "scheduler_step_per_batch", True):
+                        self.scheduler.step()
+
+                    loss_scalars.update(blend_info)
+                else:
+                    skipped += 1
+                    loss_scalars["blend_used"] = 0.0
+                    print(f"Unstable total_loss at epoch {self.epoch}, batch {batch_id} (skipping step)")
+
+            # ==========================================
+            # Branch 5: PCGrad (gradient surgery)
+            # ==========================================
+            elif mo_method == "pcgrad":
+                report_total, report_info = self.combine_losses(loss_tensors)
+                report_info = {
+                    k: (float(v.detach().item()) if hasattr(v, "detach") else float(v))
+                    for k, v in (report_info or {}).items()
+                }
+                loss_scalars["total_loss"] = float(report_total.detach().item())
+                loss_scalars.update(report_info)
+
+                if np.isfinite(loss_scalars["total_loss"]):
+                    pcgrad_info = self._step_with_pcgrad(loss_tensors)
+
+                    clip = self.params.get("clip_gradients_to", None)
+                    if clip:
+                        nn.utils.clip_grad_norm_(self.net.parameters(), clip)
+
+                    self.optimizer.step()
+                    did_step = 1.0
+
+                    if hasattr(self, "update_ema"):
+                        self.update_ema()
+
+                    if getattr(self, "use_scheduler", False) and getattr(self, "scheduler_step_per_batch", True):
+                        self.scheduler.step()
+
+                    loss_scalars.update(pcgrad_info)
+                else:
+                    skipped += 1
+                    loss_scalars["pcgrad_used"] = 0.0
+                    print(f"Unstable total_loss at epoch {self.epoch}, batch {batch_id} (skipping step)")
+
+            # ==========================================
+            # Branch 6: IMTL-G (impartial multi-task)
+            # ==========================================
+            elif mo_method == "imtlg":
+            
+                report_total, report_info = self.combine_losses(loss_tensors)
+                report_info = {
+                    k: (float(v.detach().item()) if hasattr(v, "detach") else float(v))
+                    for k, v in (report_info or {}).items()
+                }
+                loss_scalars["total_loss"] = float(report_total.detach().item())
+                loss_scalars.update(report_info)
+
+                if np.isfinite(loss_scalars["total_loss"]):
+                    imtlg_info = self._step_with_imtlg(loss_tensors)
+
+                    clip = self.params.get("clip_gradients_to", None)
+                    if clip:
+                        nn.utils.clip_grad_norm_(self.net.parameters(), clip)
+
+                    self.optimizer.step()
+                    did_step = 1.0
+
+                    if hasattr(self, "update_ema"):
+                        self.update_ema()
+
+                    if getattr(self, "use_scheduler", False) and getattr(self, "scheduler_step_per_batch", True):
+                        self.scheduler.step()
+
+                    loss_scalars.update(imtlg_info)
+                else:
+                    skipped += 1
+                    loss_scalars["imtlg_used"] = 0.0
+                    print(f"Unstable total_loss at epoch {self.epoch}, batch {batch_id} (skipping step)")
+            # ==========================================
+            # Branch 7: GradNorm
+            # ==========================================
+            elif mo_method == "gradnorm":
+                report_total, report_info = self.combine_losses(loss_tensors)
+                report_info = {
+                    k: (float(v.detach().item()) if hasattr(v, "detach") else float(v))
+                    for k, v in (report_info or {}).items()
+                }
+                loss_scalars["total_loss"] = float(report_total.detach().item())
+                loss_scalars.update(report_info)
+            
+                if np.isfinite(loss_scalars["total_loss"]):
+                    gradnorm_info = self._step_with_gradnorm(loss_tensors)
+            
+                    clip = self.params.get("clip_gradients_to", None)
+                    if clip:
+                        nn.utils.clip_grad_norm_(self.net.parameters(), clip)
+            
+                    self.optimizer.step()
+                    did_step = 1.0
+            
+                    if hasattr(self, "update_ema"):
+                        self.update_ema()
+            
+                    if getattr(self, "use_scheduler", False) and getattr(self, "scheduler_step_per_batch", True):
+                        self.scheduler.step()
+            
+                    loss_scalars.update(gradnorm_info)
+                else:
+                    skipped += 1
+                    loss_scalars["gradnorm_used"] = 0.0
+                    print(f"Unstable total_loss at epoch {self.epoch}, batch {batch_id} (skipping step)")
+            
+            else:
+            
+                raise ValueError(f"Unknown mo_method: '{mo_method}'. "
+                     f"Valid options: none, weighted_sum, config, grad_blend, pcgrad, imtlg")
             loss_scalars["did_step"] = float(did_step)
-    
+
             # Accumulate batch metrics
             for k, v in loss_scalars.items():
                 batch_metrics.setdefault(k, []).append(float(v))
@@ -856,7 +1353,7 @@ class GenerativeModel(nn.Module):
         
         # Collect all *_epoch metrics
         metrics = {}
-        for attr_name in dir(self):
+        for attr_name in self.__dict__:
             if attr_name.endswith('_epoch') and not attr_name.startswith('_'):
                 try:
                     arr = getattr(self, attr_name)
@@ -1047,7 +1544,7 @@ class GenerativeModel(nn.Module):
     
     def reconstruct_n(self,):
         print("inside reconstruct_n")
-        if ~hasattr(self, 'train_loader'):
+        if not hasattr(self, 'train_loader'):
             self.train_loader, self.val_loader, self.bounds = get_loaders(
                 self.params.get('hdf5_file'),
                 self.params.get('particle_type'),
@@ -1213,6 +1710,10 @@ class GenerativeModel(nn.Module):
             "epoch": self.epoch,
             "scheduler": self.scheduler.state_dict()
         }
+        if self.gradnorm_balancer is not None:
+            save_dict["gradnorm_log_w"] = self.gradnorm_balancer.log_w.data
+            save_dict["gradnorm_L0"]    = self.gradnorm_balancer.L0
+            save_dict["gradnorm_w_optim"] = self.gradnorm_balancer.w_optim.state_dict()
         # save_dict["energy_loss_cond_epoch"] = self.energy_loss_cond_epoch
         # save_dict["energy_loss_truth_epoch"] = self.energy_loss_truth_epoch
 
@@ -1232,6 +1733,11 @@ class GenerativeModel(nn.Module):
             self.train_losses_epoch = state_dicts.get("losses", {})
         if "epoch" in state_dicts:
             self.epoch = state_dicts.get("epoch", 0)
+       
+        if "gradnorm_log_w" in state_dicts and self.gradnorm_balancer is not None:
+            self.gradnorm_balancer.log_w.data = state_dicts["gradnorm_log_w"]
+            self.gradnorm_balancer.L0         = state_dicts["gradnorm_L0"]
+            self.gradnorm_balancer.w_optim.load_state_dict(state_dicts["gradnorm_w_optim"])
         #if "opt" in state_dicts:
         #    self.optimizer.load_state_dict(state_dicts["opt"])
         #if "scheduler" in state_dicts:
@@ -1255,7 +1761,7 @@ class GenerativeModel(nn.Module):
         # choose model
         if model_class == 'TBD':
             Model = self.__class__
-        if model_class == 'TransfusionAR':
+        elif model_class == 'TransfusionAR':
             from Models import TransfusionAR
             Model = TransfusionAR
         elif model_class == 'AE':
@@ -1267,6 +1773,9 @@ class GenerativeModel(nn.Module):
         elif model_class=='TBD_DIFF':
             from Models import TBD_DIFF
             Model=TBD_DIFF
+        else:
+            raise ValueError(f"Unknown model_class: '{model_class}'")
+
             
 
         # load model
