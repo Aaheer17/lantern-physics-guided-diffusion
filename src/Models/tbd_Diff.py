@@ -65,7 +65,25 @@ class TBD_DIFF(GenerativeModel):
             'xml_filename',
             '/project/biocomplexity/fa7sa/calo_dreamer/src/challenge_files/binning_dataset_2.xml'
         )
-        
+        # Load once at startup, move to GPU immediately
+        # In tbd_Diff.__init__ — replace your current bare torch.load with this
+        lap_path = self.params.get(
+            'laplacian_path',
+            '/scratch/fa7sa/LANTERN_rewrite/LANTERN_20_FEB/LANTERN_new/src/calo_laplacian.pt'
+        )
+        lambda_max_path = self.params.get(
+            'lambda_max_path',
+            '/scratch/fa7sa/LANTERN_rewrite/LANTERN_20_FEB/LANTERN_new/src/lambda_max.pt'
+        )
+        _L = torch.load(lap_path, weights_only=True)
+        self.L = _L.to(self.device)
+        _ones = torch.ones(self.L.shape[0], device=self.device)
+        _res  = torch.sparse.mm(self.L, _ones.unsqueeze(1)).abs().max()
+        assert _res < 1e-4, f"Laplacian corrupted: max|L·1|={_res:.2e}"
+        print(f"[Laplacian] Loaded: shape={self.L.shape}, nnz={self.L._nnz()}")
+        lambda_max = torch.load(lambda_max_path, weights_only=True).item()
+        self.lambda_max_sq = torch.tensor(lambda_max ** 2, dtype=torch.float32, device=self.device)
+        print(f"[Laplacian] λ_max={lambda_max:.4f},λ_max²{self.lambda_max_sq.item():.4f}")
         print(f"\nData Paths:")
         print(f"  Stats directory: {self.stats_dir}")
         print(f"  XML file: {self.xml_file}")
@@ -1063,7 +1081,27 @@ class TBD_DIFF(GenerativeModel):
             aux_loss_scalars['voxel_energy_loss_ratio'] = (
                 weighted_voxel_loss.item() / voxel_energy_loss.item()
             )
-
+        # ========================================
+        # 4. LAPLACIAN SMOOTHNESS LOSS
+        # ========================================
+        if self.L is not None:
+            
+            lap_eps    = self.params.get('laplacian_loss_eps',    0.1)
+            lap_weight = self.params.get('laplacian_loss_weight', 0.01)
+        
+            # Pass x0_pred and x_real directly — function handles the squeeze internally
+            lap_loss = self.laplacian_loss_log(voxels_pred, voxels_true, self.L)
+            weighted_lap_loss = lap_loss * lap_weight
+            print('Lip oil: ',lap_loss)
+            aux_loss_tensors['laplacian_loss']            = weighted_lap_loss
+            aux_loss_scalars['laplacian_loss_unweighted'] = lap_loss.item()
+            aux_loss_scalars['laplacian_loss']            = weighted_lap_loss.item()
+            aux_loss_scalars['laplacian_loss_weight']     = lap_weight
+        else:
+            aux_loss_scalars['laplacian_loss_unweighted'] = 0.0
+            aux_loss_scalars['laplacian_loss']            = 0.0
+            aux_loss_scalars['laplacian_loss_weight']     = 0.0
+            
         # ========================================
         # Sparsity logging
         # ========================================
@@ -1077,7 +1115,23 @@ class TBD_DIFF(GenerativeModel):
 
         return aux_loss_tensors, aux_loss_scalars
 
-
+    def laplacian_loss_log(self, x_pred, x_true, L):
+        """
+        x_pred, x_true : (B, 45, 16, 9) — already in log/preprocessed space
+        L               : preloaded sparse Laplacian on GPU, shape (6480, 6480)
+        """
+        B = x_pred.shape[0]
+        N = 45 * 16 * 9
+    
+        # Data is already preprocessed — use directly
+        pred_flat = x_pred.reshape(B, N)   # (B, N)
+        true_flat = x_true.reshape(B, N)   # (B, N)
+    
+        # sparse mm: (N, N) @ (N, B) → (N, B) → transpose → (B, N)
+        Lx_pred = torch.sparse.mm(L, pred_flat.T).T
+        Lx_true = torch.sparse.mm(L, true_flat.T).T
+    
+        return F.mse_loss(Lx_pred, Lx_true)/self.lambda_max_sq
         
     def batch_loss(self, x):
         """
